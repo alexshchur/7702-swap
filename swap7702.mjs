@@ -18,6 +18,9 @@ import { to7702SimpleSmartAccount } from "permissionless/accounts";
 
 const WETH = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
 const USDCe = "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8";
+// Uniswap V3 periphery SwapRouter (classic transferFrom flow; works with ERC20 approve)
+const SWAP_ROUTER_V3 = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+// Uniswap SwapRouter02 (some deployments & codepaths can be stricter; keep optional)
 const SWAP_ROUTER02 = "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45";
 const UNISWAP_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984";
 
@@ -267,6 +270,18 @@ async function main() {
     throw new Error("Missing PRIVATE_KEY or PIMLICO_API_KEY in .env");
 
   const usePaymaster = process.env.USE_PAYMASTER !== "0";
+  const mode = (process.env.MODE ?? "batch").toLowerCase();
+  if (!new Set(["batch", "approve", "swap-only"]).has(mode)) {
+    throw new Error(
+      `Invalid MODE=${mode}. Use MODE=batch (approve+swap), MODE=approve, or MODE=swap-only.`,
+    );
+  }
+
+  const routerChoice = (process.env.ROUTER ?? "v3").toLowerCase();
+  const routerAddress =
+    routerChoice === "02" || routerChoice === "router02"
+      ? SWAP_ROUTER02
+      : SWAP_ROUTER_V3;
 
   const owner = privateKeyToAccount(pk);
 
@@ -307,6 +322,7 @@ async function main() {
   });
 
   console.log(`Paymaster sponsorship: ${usePaymaster ? "ON" : "OFF"}`);
+  console.log(`Router: ${routerAddress} (ROUTER=${routerChoice})`);
 
   const wethBalance = await publicClient.readContract({
     address: WETH,
@@ -356,10 +372,19 @@ async function main() {
   }
   console.log(`Using Uniswap V3 pool ${pool} with fee=${fee}`);
 
+  const allowanceBefore = await publicClient.readContract({
+    address: WETH,
+    abi: wethAbi,
+    functionName: "allowance",
+    args: [owner.address, routerAddress],
+  });
+  console.log(`WETH allowance before: ${allowanceBefore}`);
+
   const approveData = encodeFunctionData({
     abi: wethAbi,
     functionName: "approve",
-    args: [SWAP_ROUTER02, amountIn],
+    // Classic: approve the router to pull WETH via transferFrom.
+    args: [routerAddress, 2n ** 256n - 1n],
   });
 
   const swapData = encodeFunctionData({
@@ -411,8 +436,12 @@ async function main() {
           },
         ]
       : []),
-    { to: WETH, value: 0n, data: approveData },
-    { to: SWAP_ROUTER02, value: 0n, data: swapData },
+    ...(mode === "swap-only"
+      ? []
+      : [{ to: WETH, value: 0n, data: approveData }]),
+    ...(mode === "approve"
+      ? []
+      : [{ to: routerAddress, value: 0n, data: swapData }]),
   ];
 
   if (!isDelegated) {
@@ -456,6 +485,13 @@ async function main() {
     args: [owner.address],
   });
 
+  const allowanceAfter = await publicClient.readContract({
+    address: WETH,
+    abi: wethAbi,
+    functionName: "allowance",
+    args: [owner.address, routerAddress],
+  });
+
   console.log("\nBalances (raw units)");
   console.log("WETH", {
     before: wethBalance.toString(),
@@ -464,6 +500,10 @@ async function main() {
   console.log("USDCe", {
     before: usdcBefore.toString(),
     after: usdcAfter.toString(),
+  });
+  console.log("Allowance", {
+    before: allowanceBefore.toString(),
+    after: allowanceAfter.toString(),
   });
 
   if (userOp && userOp.success === false) {
