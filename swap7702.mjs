@@ -5,10 +5,12 @@ import {
   encodeFunctionData,
   http,
   decodeErrorResult,
+  decodeEventLog,
   zeroAddress,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arbitrum } from "viem/chains";
+import { entryPoint08Abi, entryPoint08Address } from "viem/account-abstraction";
 
 import { createPimlicoClient } from "permissionless/clients/pimlico";
 import { createSmartAccountClient } from "permissionless";
@@ -56,6 +58,17 @@ const erc20Abi = [
       { name: "spender", type: "address" },
     ],
     outputs: [{ name: "", type: "uint256" }],
+  },
+];
+
+const wethAbi = [
+  ...erc20Abi,
+  {
+    type: "function",
+    name: "deposit",
+    stateMutability: "payable",
+    inputs: [],
+    outputs: [],
   },
 ];
 
@@ -151,6 +164,76 @@ function tryDecodeExecuteError(revertData) {
   }
 }
 
+async function diagnoseBundleTx({ publicClient, bundleTxHash }) {
+  const receipt = await publicClient.getTransactionReceipt({
+    hash: bundleTxHash,
+  });
+
+  console.log(`\nBundle tx ${bundleTxHash}`);
+  console.log(`status=${receipt.status} block=${receipt.blockNumber}`);
+
+  const epLogs = receipt.logs.filter(
+    (l) => l.address.toLowerCase() === entryPoint08Address.toLowerCase(),
+  );
+  console.log(`EntryPoint(${entryPoint08Address}) logs: ${epLogs.length}`);
+
+  let sawUserOpEvent = false;
+  /** @type {undefined | { sender: string, success: boolean, nonce: string, userOpHash: string }} */
+  let lastUserOp;
+  for (const log of epLogs) {
+    try {
+      const decoded = decodeEventLog({
+        abi: entryPoint08Abi,
+        data: log.data,
+        topics: log.topics,
+      });
+
+      if (decoded.eventName === "UserOperationEvent") {
+        sawUserOpEvent = true;
+        lastUserOp = {
+          sender: decoded.args.sender,
+          success: decoded.args.success,
+          nonce: decoded.args.nonce?.toString?.() ?? decoded.args.nonce,
+          userOpHash: decoded.args.userOpHash,
+        };
+        console.log("UserOperationEvent", {
+          sender: decoded.args.sender,
+          success: decoded.args.success,
+          nonce: decoded.args.nonce?.toString?.() ?? decoded.args.nonce,
+          actualGasCost:
+            decoded.args.actualGasCost?.toString?.() ??
+            decoded.args.actualGasCost,
+          actualGasUsed:
+            decoded.args.actualGasUsed?.toString?.() ??
+            decoded.args.actualGasUsed,
+          userOpHash: decoded.args.userOpHash,
+        });
+      }
+
+      if (decoded.eventName === "UserOperationRevertReason") {
+        console.log("UserOperationRevertReason", {
+          sender: decoded.args.sender,
+          nonce: decoded.args.nonce?.toString?.() ?? decoded.args.nonce,
+          userOpHash: decoded.args.userOpHash,
+        });
+        const revertReason = decoded.args.revertReason;
+        console.log("revertReason:", revertReason);
+        tryDecodeExecuteError(revertReason);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!sawUserOpEvent) {
+    console.log(
+      "No UserOperationEvent found in this bundle tx. It may not be an EntryPoint v0.8 bundle, or RPC did not return logs.",
+    );
+  }
+
+  return lastUserOp;
+}
+
 // Uniswap V3 SwapRouter02 exactInputSingle((...)) ABI
 const swapRouterAbi = [
   {
@@ -192,6 +275,12 @@ async function main() {
     transport: http("https://arb1.arbitrum.io/rpc"),
   });
 
+  const diagTx = process.env.DIAG_TX_HASH;
+  if (diagTx) {
+    await diagnoseBundleTx({ publicClient, bundleTxHash: diagTx });
+    return;
+  }
+
   // Pimlico client (bundler + paymaster endpoints share the same RPC URL)
   const pimlicoUrl = `https://api.pimlico.io/v2/${arbitrum.id}/rpc?apikey=${pimlicoKey}`;
   const pimlicoClient = createPimlicoClient({
@@ -221,14 +310,24 @@ async function main() {
 
   const wethBalance = await publicClient.readContract({
     address: WETH,
+    abi: wethAbi,
+    functionName: "balanceOf",
+    args: [owner.address],
+  });
+
+  const usdcBefore = await publicClient.readContract({
+    address: USDCe,
     abi: erc20Abi,
     functionName: "balanceOf",
     args: [owner.address],
   });
-  if (wethBalance < amountIn) {
+
+  const ethBalance = await publicClient.getBalance({ address: owner.address });
+  const shouldWrapEthToWeth = wethBalance < amountIn && ethBalance >= amountIn;
+  if (wethBalance < amountIn && !shouldWrapEthToWeth) {
     throw new Error(
-      `Insufficient WETH balance. Have ${wethBalance} wei, need ${amountIn} wei. ` +
-        `Fund ${owner.address} with WETH on Arbitrum or reduce amountIn.`,
+      `Insufficient WETH balance. Have ${wethBalance} wei WETH and ${ethBalance} wei ETH; need ${amountIn} wei WETH. ` +
+        `Either fund ${owner.address} with WETH on Arbitrum or increase ETH so it can be wrapped.`,
     );
   }
 
@@ -258,7 +357,7 @@ async function main() {
   console.log(`Using Uniswap V3 pool ${pool} with fee=${fee}`);
 
   const approveData = encodeFunctionData({
-    abi: erc20Abi,
+    abi: wethAbi,
     functionName: "approve",
     args: [SWAP_ROUTER02, amountIn],
   });
@@ -298,6 +397,24 @@ async function main() {
   };
 
   let txHash;
+  const calls = [
+    ...(shouldWrapEthToWeth
+      ? [
+          {
+            to: WETH,
+            value: amountIn,
+            data: encodeFunctionData({
+              abi: wethAbi,
+              functionName: "deposit",
+              args: [],
+            }),
+          },
+        ]
+      : []),
+    { to: WETH, value: 0n, data: approveData },
+    { to: SWAP_ROUTER02, value: 0n, data: swapData },
+  ];
+
   if (!isDelegated) {
     // First time: include 7702 authorization to set EOA code to the implementation
     const nonce = await publicClient.getTransactionCount({
@@ -305,10 +422,7 @@ async function main() {
     });
 
     txHash = await smartAccountClient.sendTransaction({
-      calls: [
-        { to: WETH, value: 0n, data: approveData },
-        { to: SWAP_ROUTER02, value: 0n, data: swapData },
-      ],
+      calls,
       ...userOpGasOverrides,
       authorization: await owner.signAuthorization({
         address: SIMPLE_7702_IMPL,
@@ -319,15 +433,44 @@ async function main() {
   } else {
     // Already delegated: no need to include authorization
     txHash = await smartAccountClient.sendTransaction({
-      calls: [
-        { to: WETH, value: 0n, data: approveData },
-        { to: SWAP_ROUTER02, value: 0n, data: swapData },
-      ],
+      calls,
       ...userOpGasOverrides,
     });
   }
 
-  console.log("sent, tx hash:", txHash);
+  console.log("sent, bundle tx hash:", txHash);
+
+  await publicClient.waitForTransactionReceipt({ hash: txHash });
+  const userOp = await diagnoseBundleTx({ publicClient, bundleTxHash: txHash });
+
+  const wethAfter = await publicClient.readContract({
+    address: WETH,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [owner.address],
+  });
+  const usdcAfter = await publicClient.readContract({
+    address: USDCe,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [owner.address],
+  });
+
+  console.log("\nBalances (raw units)");
+  console.log("WETH", {
+    before: wethBalance.toString(),
+    after: wethAfter.toString(),
+  });
+  console.log("USDCe", {
+    before: usdcBefore.toString(),
+    after: usdcAfter.toString(),
+  });
+
+  if (userOp && userOp.success === false) {
+    console.log(
+      "\nUserOperation failed (bundle tx can still be SUCCESS on-chain). No swap occurs in this case.",
+    );
+  }
 }
 
 main().catch((e) => {
