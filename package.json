@@ -1,0 +1,17 @@
+{
+  "name": "7702-swap",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "permissionless": "^0.3.4",
+    "viem": "^2.45.1"
+  }
+}
