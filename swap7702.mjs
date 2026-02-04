@@ -111,10 +111,17 @@ function extractRevertData(err) {
 }
 
 function tryDecodeExecuteError(revertData) {
-  if (!revertData || typeof revertData !== "string" || !revertData.startsWith("0x"))
+  if (
+    !revertData ||
+    typeof revertData !== "string" ||
+    !revertData.startsWith("0x")
+  )
     return;
   try {
-    const decoded = decodeErrorResult({ abi: executeErrorAbi, data: revertData });
+    const decoded = decodeErrorResult({
+      abi: executeErrorAbi,
+      data: revertData,
+    });
     if (decoded.errorName !== "ExecuteError") return;
 
     const [index, inner] = decoded.args;
@@ -123,13 +130,21 @@ function tryDecodeExecuteError(revertData) {
 
     if (inner && inner !== "0x") {
       try {
-        const innerDecoded = decodeErrorResult({ abi: executeErrorAbi, data: inner });
-        console.error(`Inner decoded error: ${innerDecoded.errorName}`, innerDecoded.args);
+        const innerDecoded = decodeErrorResult({
+          abi: executeErrorAbi,
+          data: inner,
+        });
+        console.error(
+          `Inner decoded error: ${innerDecoded.errorName}`,
+          innerDecoded.args,
+        );
       } catch {
         console.error(`Inner selector: ${inner.slice(0, 10)}`);
       }
     } else {
-      console.error(`Inner revert data is empty (target reverted without reason).`);
+      console.error(
+        `Inner revert data is empty (target reverted without reason).`,
+      );
     }
   } catch {
     // ignore
@@ -168,6 +183,8 @@ async function main() {
   if (!pk || !pimlicoKey)
     throw new Error("Missing PRIVATE_KEY or PIMLICO_API_KEY in .env");
 
+  const usePaymaster = process.env.USE_PAYMASTER !== "0";
+
   const owner = privateKeyToAccount(pk);
 
   const publicClient = createPublicClient({
@@ -192,13 +209,15 @@ async function main() {
     client: publicClient,
     chain: arbitrum,
     account,
-    paymaster: pimlicoClient,
+    ...(usePaymaster ? { paymaster: pimlicoClient } : {}),
     bundlerTransport: http(pimlicoUrl),
     userOperation: {
       estimateFeesPerGas: async () =>
         (await pimlicoClient.getUserOperationGasPrice()).fast,
     },
   });
+
+  console.log(`Paymaster sponsorship: ${usePaymaster ? "ON" : "OFF"}`);
 
   const wethBalance = await publicClient.readContract({
     address: WETH,
@@ -209,7 +228,7 @@ async function main() {
   if (wethBalance < amountIn) {
     throw new Error(
       `Insufficient WETH balance. Have ${wethBalance} wei, need ${amountIn} wei. ` +
-        `Fund ${owner.address} with WETH on Arbitrum or reduce amountIn.`
+        `Fund ${owner.address} with WETH on Arbitrum or reduce amountIn.`,
     );
   }
 
@@ -232,8 +251,8 @@ async function main() {
   if (!fee) {
     throw new Error(
       `No Uniswap V3 pool found for WETH/USDCe on fee tiers ${feeCandidates.join(
-        ","
-      )}.`
+        ",",
+      )}.`,
     );
   }
   console.log(`Using Uniswap V3 pool ${pool} with fee=${fee}`);
@@ -263,6 +282,21 @@ async function main() {
 
   const isDelegated = await smartAccountClient.account.isDeployed();
 
+  // Workaround: some bundlers (and some account implementations) can fail `eth_estimateUserOperationGas`
+  // when gas fields are zero during simulation, producing `ExecuteError(..., 0x)`.
+  // Providing explicit gas limits skips gas estimation in `prepareUserOperation`.
+  const userOpGasOverrides = {
+    callGasLimit: 1_200_000n,
+    verificationGasLimit: 1_200_000n,
+    preVerificationGas: 120_000n,
+    ...(usePaymaster
+      ? {
+          paymasterVerificationGasLimit: 400_000n,
+          paymasterPostOpGasLimit: 80_000n,
+        }
+      : {}),
+  };
+
   let txHash;
   if (!isDelegated) {
     // First time: include 7702 authorization to set EOA code to the implementation
@@ -275,6 +309,7 @@ async function main() {
         { to: WETH, value: 0n, data: approveData },
         { to: SWAP_ROUTER02, value: 0n, data: swapData },
       ],
+      ...userOpGasOverrides,
       authorization: await owner.signAuthorization({
         address: SIMPLE_7702_IMPL,
         chainId: arbitrum.id,
@@ -288,6 +323,7 @@ async function main() {
         { to: WETH, value: 0n, data: approveData },
         { to: SWAP_ROUTER02, value: 0n, data: swapData },
       ],
+      ...userOpGasOverrides,
     });
   }
 
@@ -297,6 +333,14 @@ async function main() {
 main().catch((e) => {
   const revertData = extractRevertData(e);
   if (revertData) tryDecodeExecuteError(revertData);
+
+  const message = `${e?.details ?? ""} ${e?.shortMessage ?? ""} ${e?.message ?? ""}`;
+  if (message.includes("Insufficient Pimlico balance for sponsorship")) {
+    console.error(
+      "\nPimlico paymaster sponsorship failed: your Pimlico balance is empty. " +
+        "Top up your Pimlico account, or run with `USE_PAYMASTER=0` and fund the sender address with ETH to pay gas.",
+    );
+  }
   console.error(e);
   process.exit(1);
 });
